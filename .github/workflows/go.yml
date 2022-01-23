@@ -22,16 +22,12 @@ jobs:
   build:
     strategy:
       matrix:
+        goos: [windows, linux, darwin]
+        goarch: [amd64, arm64]
         include:
         - goos: linux
           goarch: arm
           goarm: 7
-        - goos: linux
-          goarch: amd64
-        - goos: darwin
-          goarch: amd64
-        - goos: darwin
-          goarch: arm64
     runs-on: ubuntu-latest
     env:
       GOOS: ${{ matrix.goos }}
@@ -43,10 +39,11 @@ jobs:
       with:
         fetch-depth: 0
 
-    - id: get_filename
+    - name: Get asset filename
+      id: get_filename
       run: |
         echo "::set-output name=ASSET_NAME::$GOOS-$GOARCH$GOARM"
-        echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
+        echo "ASSET_NAME=$GOOS-$GOARCH$GOARM" >> $GITHUB_ENV
 
     - name: Set up Go
       uses: actions/setup-go@v2
@@ -65,7 +62,7 @@ jobs:
         cd build
         zip -vr release.zip .
       
-    - name: Upload
+    - name: Upload artifact
       uses: actions/upload-artifact@v2
       with:
         name: m3u8-downloader-${{ steps.get_filename.outputs.ASSET_NAME }}.zip
