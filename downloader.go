@@ -106,7 +106,7 @@ func (d *Downloader) download(inputUrl string, isInitUrl bool) {
 
 	req, err := http.NewRequest("GET", normalizedUrl, nil)
 	if err != nil {
-		panic(fmt.Sprintf("create request error: %s", err.Error()))
+		panic(fmt.Errorf("create request error: %w", err))
 	}
 
 	req.Header.Set("User-Agent", ua)
@@ -118,7 +118,7 @@ func (d *Downloader) download(inputUrl string, isInitUrl bool) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		panic(fmt.Sprintf("download '%s' failed, status code: %d", inputUrl, resp.StatusCode))
+		panic(fmt.Errorf("download '%s' failed, status code: %d", inputUrl, resp.StatusCode))
 	}
 
 	contentType := resp.Header.Get("Content-Type")
