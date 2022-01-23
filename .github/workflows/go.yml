@@ -57,11 +57,11 @@ jobs:
       run: ./scripts/build.sh
 
     - name: Test
+      if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
       run: go test -v
     
     - name: Zip
       run: |
-        mkdir build
         cd build
         zip -vr release.zip .
       
