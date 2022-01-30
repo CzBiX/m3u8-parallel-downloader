@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -20,12 +19,19 @@ var bufPool = sync.Pool{
 }
 
 type CachedResult struct {
+	downloadJob
 	Data        io.WriterTo
 	ContentType string
 }
 
+type downloadJob struct {
+	index int
+	url   string
+}
+
 func (r *CachedResult) Close() error {
-	bufPool.Put(r.Data.(*bytes.Buffer))
+	bufPool.Put(r.Data)
+	r.Data = nil
 
 	return nil
 }
@@ -38,7 +44,7 @@ type Downloader struct {
 	cond            *sync.Cond
 	downloadedCount int32
 	totalCount      int
-	inputChan       chan string
+	inputChan       chan downloadJob
 }
 
 func NewDownloader(url string) *Downloader {
@@ -46,10 +52,13 @@ func NewDownloader(url string) *Downloader {
 		client:    &http.Client{},
 		cond:      sync.NewCond(new(sync.Mutex)),
 		buffered:  make(map[string]CachedResult),
-		inputChan: make(chan string),
+		inputChan: make(chan downloadJob),
 	}
 
-	go downloader.download(url, true)
+	go downloader.download(downloadJob{
+		index: 0,
+		url:   url,
+	}, true)
 
 	for i := 0; i < *workerNum; i++ {
 		go downloader.worker()
@@ -59,20 +68,20 @@ func NewDownloader(url string) *Downloader {
 }
 
 func (d *Downloader) worker() {
-	for url := range d.inputChan {
-		d.download(url, false)
+	for job := range d.inputChan {
+		d.download(job, false)
 	}
 }
 
-func (d *Downloader) putResult(url string, result CachedResult) {
+func (d *Downloader) putResult(result CachedResult) {
 	d.cond.L.Lock()
 	defer d.cond.L.Unlock()
 
-	for len(d.buffered) >= *chunkNum {
+	for (int(d.downloadedCount) + *chunkNum) < result.index {
 		d.cond.Wait()
 	}
 
-	d.buffered[url] = result
+	d.buffered[result.url] = result
 	d.cond.Broadcast()
 
 	d.printStatus()
@@ -89,19 +98,19 @@ func (d *Downloader) normalizeUrl(inputUrl string) string {
 	return u.String()
 }
 
-func (d *Downloader) onDownloadFailed(url string, err error) {
-	fmt.Printf("Download '%s' failed, %s", url, err.Error())
+func (d *Downloader) onDownloadFailed(job downloadJob, err error) {
+	fmt.Printf("Download '%v' failed, %s", job, err.Error())
 	time.Sleep(time.Second * 3)
 
-	d.inputChan <- url
+	d.inputChan <- job
 }
 
-func (d *Downloader) download(inputUrl string, isInitUrl bool) {
+func (d *Downloader) download(job downloadJob, isInitUrl bool) {
 	var normalizedUrl string
 	if isInitUrl {
-		normalizedUrl = inputUrl
+		normalizedUrl = job.url
 	} else {
-		normalizedUrl = d.normalizeUrl(inputUrl)
+		normalizedUrl = d.normalizeUrl(job.url)
 	}
 
 	req, err := http.NewRequest("GET", normalizedUrl, nil)
@@ -113,12 +122,12 @@ func (d *Downloader) download(inputUrl string, isInitUrl bool) {
 
 	resp, err := d.client.Do(req)
 	if err != nil {
-		d.onDownloadFailed(inputUrl, err)
+		d.onDownloadFailed(job, err)
 		return
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		panic(fmt.Errorf("download '%s' failed, status code: %d", inputUrl, resp.StatusCode))
+		panic(fmt.Errorf("download '%v' failed, status code: %d", job, resp.StatusCode))
 	}
 
 	contentType := resp.Header.Get("Content-Type")
@@ -127,17 +136,18 @@ func (d *Downloader) download(inputUrl string, isInitUrl bool) {
 	buf.Reset()
 
 	if _, err := buf.ReadFrom(resp.Body); err != nil {
-		d.onDownloadFailed(inputUrl, err)
+		d.onDownloadFailed(job, err)
 		return
 	}
 
 	result := CachedResult{
+		downloadJob: job,
 		Data:        buf,
 		ContentType: contentType,
 	}
 
 	if !isInitUrl {
-		d.putResult(inputUrl, result)
+		d.putResult(result)
 		return
 	}
 
@@ -147,11 +157,17 @@ func (d *Downloader) download(inputUrl string, isInitUrl bool) {
 	d.baseUrl = req.URL
 	d.totalCount = len(urls) + 1
 
-	d.putResult(INDEX_FILE_NAME, result)
+	result.url = INDEX_FILE_NAME
+	d.putResult(result)
 
-	for _, url := range urls {
-		d.inputChan <- url
+	for i, url := range urls {
+		d.inputChan <- downloadJob{
+			index: i + 1,
+			url:   url,
+		}
 	}
+
+	close(d.inputChan)
 }
 
 // Get the data of the url. will wait unitl the data is ready.
@@ -163,8 +179,8 @@ func (d *Downloader) GetResult(url string) CachedResult {
 		data, ok := d.buffered[url]
 		if ok {
 			delete(d.buffered, url)
-			atomic.AddInt32(&d.downloadedCount, 1)
-			d.cond.Signal()
+			d.downloadedCount++
+			d.cond.Broadcast()
 
 			d.printStatus()
 			return data

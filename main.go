@@ -21,8 +21,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *chunkNum < *workerNum {
-		fmt.Println("chunkNum must be greater than or equal to workerNum")
+	if *chunkNum < 1 {
+		fmt.Println("chunkNum must be greater than 0")
 		os.Exit(1)
 	}
 
