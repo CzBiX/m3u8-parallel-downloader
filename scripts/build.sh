@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 OUTPUT=${1:-"build/m3u8-parallel-downloader"}
 
