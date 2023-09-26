@@ -20,7 +20,7 @@ var bufPool = sync.Pool{
 
 type CachedResult struct {
 	downloadJob
-	Data        io.WriterTo
+	Data        *bytes.Buffer
 	ContentType string
 }
 
@@ -127,7 +127,11 @@ func (d *Downloader) download(job downloadJob, isInitUrl bool) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		panic(fmt.Errorf("download '%v' failed, status code: %d", job, resp.StatusCode))
+		fmt.Printf("Download '%v' failed, status code: %d", job, resp.StatusCode)
+		if data, err := io.ReadAll(resp.Body); err == nil {
+			fmt.Printf("Content: %s", data)
+		}
+		panic("Download failed")
 	}
 
 	contentType := resp.Header.Get("Content-Type")
@@ -178,7 +182,9 @@ func (d *Downloader) GetResult(url string) CachedResult {
 	for {
 		data, ok := d.buffered[url]
 		if ok {
-			delete(d.buffered, url)
+			if url != INDEX_FILE_NAME {
+				delete(d.buffered, url)
+			}
 			d.downloadedCount++
 			d.cond.Broadcast()
 
