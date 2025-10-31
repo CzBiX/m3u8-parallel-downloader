@@ -16,16 +16,19 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	path := request.URL.Path
 	if path == "/" {
 		path = INDEX_FILE_NAME
+	} else {
+		path = path[1:]
 	}
 
-	result := s.Downloader.GetResult(path)
-	writer.Header().Set("Content-Type", result.ContentType)
-	if path == INDEX_FILE_NAME {
-		writer.Write(result.Data.Bytes())
-	} else {
-		result.Data.WriteTo(writer)
-		result.Close()
+	result, err := s.Downloader.Get(path)
+	if err != nil {
+		http.Error(writer, err.Error(), http.StatusInternalServerError)
+		return
 	}
+
+	writer.Header().Set("Content-Type", result.ContentType)
+	result.Data.WriteTo(writer)
+	result.Close()
 }
 
 func (s *Server) Start() error {

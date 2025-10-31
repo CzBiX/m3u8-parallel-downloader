@@ -6,7 +6,7 @@ import (
 	"os"
 )
 
-const ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.71 Safari/537.36"
+const ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
 var addr = flag.String("addr", "127.0.0.1:8080", "HTTP listen address")
 var workerNum = flag.Int("worker", 3, "number of workers")
@@ -26,7 +26,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	downloader := NewDownloader(*input)
+	downloader := NewDownloader(*input, *chunkNum, *workerNum)
 
 	server := &Server{
 		Addr:       *addr,

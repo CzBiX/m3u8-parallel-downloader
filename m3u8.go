@@ -25,7 +25,7 @@ func ParseM3U8Urls(buf *bytes.Buffer) []string {
 	count := mediaList.Count()
 	urls := make([]string, count)
 
-	for i := uint(0); i < count; i++ {
+	for i := range count {
 		urls[i] = mediaList.Segments[i].URI
 	}
 
