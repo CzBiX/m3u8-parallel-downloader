@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"sync"
 	"time"
 )
@@ -269,11 +270,18 @@ func (d *Downloader) putChunk(idx int, chunk *Chunk) {
 	delete(d.retries, idx)
 
 	cached := len(d.cache)
+	inflight := len(d.inflight)
 	total := len(d.urls)
 	orderCopy := append([]int(nil), d.order...)
+	inflightIdxs := make([]int, 0, inflight)
+	for k := range d.inflight {
+		inflightIdxs = append(inflightIdxs, k)
+	}
 	d.mu.Unlock()
 
-	fmt.Printf("\033[2K\r[stats] cached=%d/%d total=%d order=%v", cached, d.capacity, total, orderCopy)
+	slices.Sort(inflightIdxs)
+	fmt.Printf("\033[2K\r[stats] cached=%d/%d %v | inflight=%d %v | total=%d",
+		cached, d.capacity, orderCopy, inflight, inflightIdxs, total)
 }
 
 func (d *Downloader) removeFromOrderLocked(idx int) {
