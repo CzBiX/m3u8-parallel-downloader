@@ -37,7 +37,8 @@ func (s *Server) Start() error {
 		Handler: s,
 	}
 
-	fmt.Println("Starting server on", s.Addr)
+	fmt.Printf("Starting server on %s\n", s.Addr)
+	fmt.Printf("ffmpeg -i http://%s -c copy output.mkv\n", s.Addr)
 
 	return s.server.ListenAndServe()
 }
