@@ -2,9 +2,7 @@ package main
 
 import (
 	"bytes"
-	"container/list"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,92 +15,78 @@ const INDEX_FILE_NAME = "index.m3u8"
 
 var bufPool = sync.Pool{
 	New: func() any {
-		return new(bytes.Buffer)
+		return bytes.NewBuffer(make([]byte, 0, 64*1024))
 	},
 }
 
-type CachedResult struct {
-	downloadJob
-	Data        *bytes.Buffer
+type Chunk struct {
 	ContentType string
+	Data        *bytes.Buffer
 }
 
-type downloadJob struct {
-	index int
-	url   string
-}
-
-func (r *CachedResult) Close() error {
-	if r.Data != nil {
-		buf := r.Data
-		r.Data = nil
-		bufPool.Put(buf)
+func (c *Chunk) Close() {
+	if c.Data != nil {
+		bufPool.Put(c.Data)
+		c.Data = nil
 	}
-	return nil
 }
 
 type Downloader struct {
-	client  *http.Client
-	baseUrl *url.URL
+	baseUrl  string
+	capacity int
 
 	urls       []string
 	urlToIndex map[string]int
 
-	capacity int
-	workers  int
+	cache    map[int]*Chunk
+	order    []int
+	inflight map[int]bool
 
-	jobs chan downloadJob
+	indexParsed bool
+	errs        map[int]error
+	retries     map[int]int
+	closed      bool
+
+	mu   sync.Mutex
+	cond *sync.Cond
+	wg   sync.WaitGroup
+
+	jobs chan int
 
 	ctx    context.Context
 	cancel context.CancelFunc
-	wg     sync.WaitGroup
-
-	cond      *sync.Cond
-	buffer    map[int]*CachedResult // cached buffers
-	order     *list.List            // order list: front=oldest, back=newest
-	infight   map[int]bool          // which indexes are currently being downloaded
-	lastIndex int
 }
 
-func NewDownloader(startUrl string, capacity, workers int) *Downloader {
+const maxRetries = 5
+
+func NewDownloader(baseUrl string, capacity int, workerNum int) *Downloader {
 	ctx, cancel := context.WithCancel(context.Background())
 	d := &Downloader{
-		client:     &http.Client{},
-		urls:       make([]string, 0),
-		urlToIndex: make(map[string]int),
+		baseUrl:    baseUrl,
 		capacity:   capacity,
-		workers:    workers,
-		jobs:       make(chan downloadJob, workers*2),
+		urlToIndex: make(map[string]int),
+		cache:      make(map[int]*Chunk),
+		inflight:   make(map[int]bool),
+		errs:       make(map[int]error),
+		retries:    make(map[int]int),
+		jobs:       make(chan int, capacity),
 		ctx:        ctx,
 		cancel:     cancel,
-		buffer:     make(map[int]*CachedResult),
-		order:      list.New(),
-		lastIndex:  -1,
-		infight:    make(map[int]bool),
-		cond:       sync.NewCond(new(sync.Mutex)),
 	}
+	d.cond = sync.NewCond(&d.mu)
 
-	d.baseUrl, _ = url.Parse(startUrl)
-	d.pushJob(downloadJob{index: 0, url: startUrl})
+	d.urls = []string{INDEX_FILE_NAME}
+	d.urlToIndex[INDEX_FILE_NAME] = 0
 
-	d.startWorkers()
-
-	return d
-}
-
-func (d *Downloader) pushJob(job downloadJob) {
-	select {
-	case d.jobs <- job:
-	default:
-		go func() { d.jobs <- job }()
-	}
-}
-
-func (d *Downloader) startWorkers() {
-	for i := 0; i < d.workers; i++ {
-		d.wg.Add(1)
+	d.wg.Add(workerNum)
+	for range workerNum {
 		go d.worker()
 	}
+
+	d.inflight[0] = true
+	d.jobs <- 0
+
+	return d
 }
 
 func (d *Downloader) worker() {
@@ -111,220 +95,284 @@ func (d *Downloader) worker() {
 		select {
 		case <-d.ctx.Done():
 			return
-		case job := <-d.jobs:
-			d.download(job)
+		case idx := <-d.jobs:
+			if err := d.download(idx); err != nil {
+				fmt.Printf("download %d failed: %s\n", idx, err.Error())
+				d.mu.Lock()
+				d.retries[idx]++
+				if d.retries[idx] >= maxRetries {
+					d.errs[idx] = err
+					delete(d.inflight, idx)
+					d.mu.Unlock()
+					d.cond.Broadcast()
+					continue
+				}
+				d.mu.Unlock()
+				select {
+				case <-d.ctx.Done():
+					return
+				case <-time.After(3 * time.Second):
+				}
+				d.mu.Lock()
+				d.inflight[idx] = true
+				d.mu.Unlock()
+				d.submitJob(idx)
+				d.cond.Broadcast()
+				continue
+			}
+			d.cond.Broadcast()
 		}
 	}
 }
 
-func (d *Downloader) normalizeUrl(inputUrl string) string {
-	u, err := url.Parse(inputUrl)
-	if err != nil {
-		panic(fmt.Sprintf("parse url error: %s", err.Error()))
+func (d *Downloader) submitJob(idx int) {
+	select {
+	case d.jobs <- idx:
+	default:
+		go func() {
+			select {
+			case d.jobs <- idx:
+			case <-d.ctx.Done():
+			}
+		}()
 	}
-
-	u = d.baseUrl.ResolveReference(u)
-
-	return u.String()
 }
 
-func (d *Downloader) putResult(result *CachedResult) {
-	d.cond.L.Lock()
-	defer d.cond.L.Unlock()
-
-	// evict oldest if needed
-	if len(d.buffer) >= d.capacity {
-		e := d.order.Front()
-		oldIdx := e.Value.(int)
-		if old, ok2 := d.buffer[oldIdx]; ok2 {
-			_ = old.Close()
-		}
-		delete(d.buffer, oldIdx)
-		d.order.Remove(e)
-	}
-
-	d.buffer[result.index] = result
-	d.order.PushBack(result.index)
-
-	// mark infight false and notify waiters
-	delete(d.infight, result.index)
-	d.cond.Broadcast()
-
-	d.printStatus()
-}
-
-func (d *Downloader) onDownloadFailed(job downloadJob, err error) {
-	fmt.Printf("Download '%v' failed, %s", job, err.Error())
-	time.Sleep(time.Second * 3)
-
-	d.jobs <- job
-}
-
-// download is a stubbed downloader; replace with real IO.
-func (d *Downloader) download(job downloadJob) {
-	var normalizedUrl string
-	isInitUrl := job.index == 0
-	if isInitUrl {
-		normalizedUrl = d.baseUrl.String()
+func (d *Downloader) download(idx int) error {
+	// Read URL under lock
+	d.mu.Lock()
+	var fullURL string
+	if idx == 0 {
+		fullURL = d.baseUrl
 	} else {
-		normalizedUrl = d.normalizeUrl(job.url)
+		if idx >= len(d.urls) {
+			d.mu.Unlock()
+			return fmt.Errorf("index %d out of range (len=%d)", idx, len(d.urls))
+		}
+		fullURL = d.urls[idx]
+	}
+	d.mu.Unlock()
+
+	// Build full URL for relative paths
+	if idx > 0 {
+		base, err := url.Parse(d.baseUrl)
+		if err != nil {
+			return fmt.Errorf("parse base url: %w", err)
+		}
+		ref, err := url.Parse(fullURL)
+		if err != nil {
+			return fmt.Errorf("parse ref url: %w", err)
+		}
+		fullURL = base.ResolveReference(ref).String()
 	}
 
-	req, err := http.NewRequest("GET", normalizedUrl, nil)
+	// HTTP GET
+	req, err := http.NewRequestWithContext(d.ctx, http.MethodGet, fullURL, nil)
 	if err != nil {
-		panic(fmt.Errorf("create request error: %w", err))
+		return fmt.Errorf("create request: %w", err)
 	}
-
 	req.Header.Set("User-Agent", ua)
 
-	resp, err := d.client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		d.onDownloadFailed(job, err)
-		return
+		return fmt.Errorf("http get: %w", err)
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("Download '%v' failed, status code: %d", job, resp.StatusCode)
-		if data, err := io.ReadAll(resp.Body); err == nil {
-			fmt.Printf("Content: %s", data)
-		}
-		panic("Download failed")
+		return fmt.Errorf("http status: %d", resp.StatusCode)
+	}
+
+	// Read response to buffer
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if _, err := io.Copy(buf, resp.Body); err != nil {
+		bufPool.Put(buf)
+		return fmt.Errorf("read response: %w", err)
 	}
 
 	contentType := resp.Header.Get("Content-Type")
 
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
+	// If index=0, parse m3u8 and fill urls/urlToIndex under lock
+	if idx == 0 {
+		parsedUrls := ParseM3U8Urls(buf)
+		if parsedUrls == nil {
+			bufPool.Put(buf)
+			return fmt.Errorf("parse m3u8 failed")
+		}
 
-	buf.ReadFrom(resp.Body)
-
-	if _, err = io.Copy(buf, resp.Body); err != nil {
-		bufPool.Put(buf)
-		d.onDownloadFailed(job, err)
-		return
+		d.mu.Lock()
+		// Reset urls/urlToIndex to avoid stale entries (fixes #8)
+		d.urls = []string{INDEX_FILE_NAME}
+		d.urlToIndex = make(map[string]int)
+		d.urlToIndex[INDEX_FILE_NAME] = 0
+		for _, u := range parsedUrls {
+			if _, exists := d.urlToIndex[u]; !exists {
+				d.urlToIndex[u] = len(d.urls)
+				d.urls = append(d.urls, u)
+			}
+		}
+		d.indexParsed = true
+		d.mu.Unlock()
 	}
 
-	result := &CachedResult{
-		downloadJob: job,
-		Data:        buf,
+	// Put into cache
+	d.putChunk(idx, &Chunk{
 		ContentType: contentType,
-	}
+		Data:        buf,
+	})
 
-	if !isInitUrl {
-		d.putResult(result)
-		return
-	}
-
-	urls := ParseM3U8Urls(buf)
-	fmt.Printf("%d urls found\n", len(urls))
-
-	d.urls = append([]string{INDEX_FILE_NAME}, urls...)
-	for i, u := range d.urls {
-		d.urlToIndex[u] = i
-	}
-
-	result.url = INDEX_FILE_NAME
-	d.putResult(result)
+	return nil
 }
 
-// Get blocks until the requested chunk is available and returns it.
-// After returning, the chunk is removed from internal buffer; caller must call Close().
-func (d *Downloader) Get(url string) (*CachedResult, error) {
-	d.cond.L.Lock()
-	defer d.cond.L.Unlock()
+func (d *Downloader) putChunk(idx int, chunk *Chunk) {
+	d.mu.Lock()
 
-	idx, ok := d.urlToIndex[url]
-	if !ok {
-		return nil, errors.New("url not in manifest")
+	if d.closed {
+		d.mu.Unlock()
+		chunk.Close()
+		return
+	}
+
+	// If a duplicate download produced a chunk for an idx already cached,
+	// close the old one and reuse the new (fixes #3 buffer leak on overwrite).
+	if old, ok := d.cache[idx]; ok {
+		old.Close()
+		delete(d.cache, idx)
+		d.removeFromOrderLocked(idx)
+	}
+
+	// Evict if full
+	if len(d.cache) >= d.capacity && d.capacity > 0 {
+		for len(d.order) > 0 {
+			oldest := d.order[0]
+			d.order = d.order[1:]
+			if evicted, ok := d.cache[oldest]; ok {
+				evicted.Close()
+				delete(d.cache, oldest)
+				break
+			}
+		}
+		// Compact order backing array if shrunk significantly (fixes #9)
+		if cap(d.order) > 2*len(d.order)+8 {
+			newOrder := make([]int, len(d.order))
+			copy(newOrder, d.order)
+			d.order = newOrder
+		}
+	}
+
+	d.cache[idx] = chunk
+	d.order = append(d.order, idx)
+
+	delete(d.inflight, idx)
+	delete(d.errs, idx)
+	delete(d.retries, idx)
+
+	cached := len(d.cache)
+	total := len(d.urls)
+	orderCopy := append([]int(nil), d.order...)
+	d.mu.Unlock()
+
+	fmt.Printf("\033[2K\r[stats] cached=%d/%d total=%d order=%v", cached, d.capacity, total, orderCopy)
+}
+
+func (d *Downloader) removeFromOrderLocked(idx int) {
+	for i, v := range d.order {
+		if v == idx {
+			d.order = append(d.order[:i], d.order[i+1:]...)
+			return
+		}
+	}
+}
+
+func (d *Downloader) Get(path string) (*Chunk, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Find index for path, waiting until the m3u8 is parsed if necessary.
+	idx, exists := d.urlToIndex[path]
+	for !exists {
+		if d.errs[0] != nil {
+			return nil, fmt.Errorf("index download failed: %w", d.errs[0])
+		}
+		if d.indexParsed {
+			return nil, fmt.Errorf("unknown path: %s", path)
+		}
+		if d.ctx.Err() != nil {
+			return nil, fmt.Errorf("downloader closed")
+		}
+		d.cond.Wait()
+		idx, exists = d.urlToIndex[path]
 	}
 
 	for {
-		// check cancellation
+		// Check cancellation (fixes #2)
 		if d.ctx.Err() != nil {
-			return nil, errors.New("downloader closed")
+			return nil, fmt.Errorf("downloader closed")
 		}
 
-		// 1) if in buffer, take it and return
-		if res, ok := d.buffer[idx]; ok {
-			if idx != 0 {
-				d.schedulePrefetchLocked(idx+1, d.capacity)
-			}
-			d.removeFromBufferLocked(idx)
-
-			d.lastIndex = idx
-			d.printStatus()
-			return res, nil
+		// Surface terminal download errors for this index
+		if err, ok := d.errs[idx]; ok {
+			return nil, fmt.Errorf("download %d failed: %w", idx, err)
 		}
 
-		// 2) not in buffer: if not infight, mark infight and submit a job
-		if !d.infight[idx] {
-			d.infight[idx] = true
-			d.pushJob(downloadJob{index: idx, url: d.urls[idx]})
+		// Check cache
+		if chunk, ok := d.cache[idx]; ok {
+			delete(d.cache, idx)
+			d.removeFromOrderLocked(idx)
+			go d.prefetch(idx + 1)
+			return chunk, nil
 		}
 
-		// 3) wait for notification and loop
+		// Submit download if not already in flight (fixes #3 infight dedup)
+		if !d.inflight[idx] {
+			d.inflight[idx] = true
+			d.submitJob(idx)
+		}
+
+		// Wait for notification
 		d.cond.Wait()
 	}
 }
 
-// schedulePrefetchLocked enqueues downloads for [from..to] inclusive.
-// caller MUST hold d.cond.L.
-func (d *Downloader) schedulePrefetchLocked(from, size int) {
-	if from >= len(d.urls) {
+func (d *Downloader) prefetch(from int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if len(d.urls) <= 1 {
 		return
 	}
-	to := from + size - 1
-	if to >= len(d.urls) {
-		to = len(d.urls) - 1
-	}
 
-	for i := from; i <= to; i++ {
-		if _, inBuf := d.buffer[i]; inBuf {
-			continue
-		}
-		if d.infight[i] {
-			continue
-		}
-		d.infight[i] = true
-		d.pushJob(downloadJob{
-			index: i,
-			url:   d.urls[i],
-		})
-	}
-}
-
-// removeFromBufferLocked removes index from buffer and order. caller must hold d.cond.L.
-func (d *Downloader) removeFromBufferLocked(idx int) {
-	if _, ok := d.buffer[idx]; !ok {
-		return
-	}
-	for e := d.order.Front(); e != nil; e = e.Next() {
-		if e.Value.(int) == idx {
-			d.order.Remove(e)
+	for i := range d.capacity {
+		idx := from + i
+		if idx >= len(d.urls) {
 			break
 		}
+
+		if _, ok := d.cache[idx]; ok {
+			continue
+		}
+		if d.inflight[idx] {
+			continue
+		}
+		if _, ok := d.errs[idx]; ok {
+			continue
+		}
+
+		d.inflight[idx] = true
+		d.submitJob(idx)
 	}
-	delete(d.buffer, idx)
 }
 
-// Close shuts down the downloader and releases resources.
 func (d *Downloader) Close() {
 	d.cancel()
-	// wake all waiters
-	d.cond.L.Lock()
+	d.mu.Lock()
+	d.closed = true
 	d.cond.Broadcast()
-	// cleanup buffer
-	for _, r := range d.buffer {
-		_ = r.Close()
+	for _, r := range d.cache {
+		r.Close()
 	}
-
-	d.buffer = nil
-	d.cond.L.Unlock()
+	d.cache = nil
+	d.mu.Unlock()
 	d.wg.Wait()
-}
-
-func (d *Downloader) printStatus() {
-	bufSize := len(d.buffer)
-
-	fmt.Printf("\033[2K\rstatus: %d/%d, %d buffered", d.lastIndex, len(d.urls), bufSize)
 }
