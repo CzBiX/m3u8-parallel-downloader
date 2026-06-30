@@ -14,6 +14,10 @@ import (
 
 const INDEX_FILE_NAME = "index.m3u8"
 
+// maxBufferReuseSize: buffers larger than this are not returned to the pool,
+// letting the GC reclaim the oversized allocation instead of holding it indefinitely.
+const maxBufferReuseSize = 2 * 1024 * 1024 // 2MB
+
 var bufPool = sync.Pool{
 	New: func() any {
 		return bytes.NewBuffer(make([]byte, 0, 64*1024))
@@ -27,14 +31,17 @@ type Chunk struct {
 
 func (c *Chunk) Close() {
 	if c.Data != nil {
-		bufPool.Put(c.Data)
+		if c.Data.Cap() <= maxBufferReuseSize {
+			bufPool.Put(c.Data)
+		}
 		c.Data = nil
 	}
 }
 
 type Downloader struct {
-	baseUrl  string
-	capacity int
+	baseUrl      string
+	baseUrlParsed *url.URL
+	capacity     int
 
 	urls       []string
 	urlToIndex map[string]int
@@ -62,9 +69,14 @@ const maxRetries = 5
 
 func NewDownloader(baseUrl string, capacity int, workerNum int) *Downloader {
 	ctx, cancel := context.WithCancel(context.Background())
+	parsedBase, err := url.Parse(baseUrl)
+	if err != nil {
+		panic(fmt.Sprintf("invalid base URL %q: %v", baseUrl, err))
+	}
 	d := &Downloader{
-		baseUrl:    baseUrl,
-		capacity:   capacity,
+		baseUrl:       baseUrl,
+		baseUrlParsed: parsedBase,
+		capacity:      capacity,
 		urlToIndex: make(map[string]int),
 		cache:      make(map[int]*Chunk),
 		inflight:   make(map[int]bool),
@@ -131,9 +143,14 @@ func (d *Downloader) submitJob(idx int) {
 	case d.jobs <- idx:
 	default:
 		go func() {
+			// Use a timeout to bound the goroutine lifetime if the channel
+			// stays full and the context is not cancelled.
+			timer := time.NewTimer(10 * time.Second)
+			defer timer.Stop()
 			select {
 			case d.jobs <- idx:
 			case <-d.ctx.Done():
+			case <-timer.C:
 			}
 		}()
 	}
@@ -156,15 +173,11 @@ func (d *Downloader) download(idx int) error {
 
 	// Build full URL for relative paths
 	if idx > 0 {
-		base, err := url.Parse(d.baseUrl)
-		if err != nil {
-			return fmt.Errorf("parse base url: %w", err)
-		}
 		ref, err := url.Parse(fullURL)
 		if err != nil {
 			return fmt.Errorf("parse ref url: %w", err)
 		}
-		fullURL = base.ResolveReference(ref).String()
+		fullURL = d.baseUrlParsed.ResolveReference(ref).String()
 	}
 
 	// HTTP GET
